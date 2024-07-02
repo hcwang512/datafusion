@@ -17,8 +17,10 @@
 
 //! [`HashJoinExec`] Partitioned Hash Join Operator
 
+use std::collections::HashMap;
+use std::default::Default;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::{any::Any, vec};
@@ -57,12 +59,11 @@ use arrow::compute::{and, concat_batches, take, FilterBuilder};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
-use arrow_array::cast::downcast_array;
+use arrow_array::cast::{downcast_array};
 use arrow_schema::ArrowError;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
-    internal_datafusion_err, internal_err, plan_err, project_schema, DataFusionError,
-    JoinSide, JoinType, Result,
+    internal_err, plan_err, project_schema, DataFusionError, JoinSide, JoinType, Result,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
@@ -71,12 +72,17 @@ use datafusion_physical_expr::equivalence::{
 };
 use datafusion_physical_expr::expressions::UnKnownColumn;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
+use std::sync::mpsc;
 
 use ahash::RandomState;
+use arrow_array::builder::UInt64BufferBuilder;
+// use datafusion_common_runtime::SpawnedTask;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 
 type SharedBitmapBuilder = Mutex<BooleanBufferBuilder>;
+
+const PARTITION_NUM: usize = 8;
 
 /// HashTable and input data for the left (build side) of a join
 struct JoinLeftData {
@@ -89,10 +95,10 @@ struct JoinLeftData {
     /// Counter of running probe-threads, potentially
     /// able to update `visited_indices_bitmap`
     probe_threads_counter: AtomicUsize,
-    /// Memory reservation that tracks memory used by `hash_map` hash table
-    /// `batch`. Cleared on drop.
-    #[allow(dead_code)]
-    reservation: MemoryReservation,
+    // Memory reservation that tracks memory used by `hash_map` hash table
+    // `batch`. Cleared on drop.
+    // #[allow(dead_code)]
+    // reservation: MemoryReservation,
 }
 
 impl JoinLeftData {
@@ -102,14 +108,14 @@ impl JoinLeftData {
         batch: RecordBatch,
         visited_indices_bitmap: SharedBitmapBuilder,
         probe_threads_counter: AtomicUsize,
-        reservation: MemoryReservation,
+        // reservation: MemoryReservation,
     ) -> Self {
         Self {
             hash_map,
             batch,
             visited_indices_bitmap,
             probe_threads_counter,
-            reservation,
+            // reservation,
         }
     }
 
@@ -308,7 +314,7 @@ pub struct HashJoinExec {
     /// if there is a projection, the schema isn't the same as the output schema.
     join_schema: SchemaRef,
     /// Future that consumes left input and builds the hash table
-    left_fut: OnceAsync<JoinLeftData>,
+    left_fut: OnceAsync<Vec<Arc<JoinLeftData>>>,
     /// Shared the `RandomState` for the hashing algorithm
     random_state: RandomState,
     /// Partitioning mode to use
@@ -326,6 +332,10 @@ pub struct HashJoinExec {
     pub null_equals_null: bool,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: PlanProperties,
+    // batch_count: AtomicU64,
+    // right_senders: Arc<Vec<mpsc::SyncSender<RecordBatch>>>,
+    // result_sender: mpsc::SyncSender<RecordBatch>,
+    // result_recv: mpsc::Receiver<RecordBatch>,
 }
 
 impl HashJoinExec {
@@ -692,6 +702,7 @@ impl ExecutionPlan for HashJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        println!("~~~~start a hash join execution");
         let on_left = self.on.iter().map(|on| on.0.clone()).collect::<Vec<_>>();
         let on_right = self.on.iter().map(|on| on.1.clone()).collect::<Vec<_>>();
         let left_partitions = self.left.output_partitioning().partition_count();
@@ -761,6 +772,7 @@ impl ExecutionPlan for HashJoinExec {
                 .collect(),
             None => self.column_indices.clone(),
         };
+        let (result_tx, result_rx) = mpsc::sync_channel(PARTITION_NUM);
 
         Ok(Box::pin(HashJoinStream {
             schema: self.schema(),
@@ -777,6 +789,10 @@ impl ExecutionPlan for HashJoinExec {
             build_side: BuildSide::Initial(BuildSideInitialState { left_fut }),
             batch_size,
             hashes_buffer: vec![],
+            right_senders: Vec::with_capacity(PARTITION_NUM),
+            result_rx,
+            result_tx,
+            result_count: AtomicU64::new(0),
         }))
     }
 
@@ -822,7 +838,7 @@ async fn collect_left_input(
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
     probe_threads_count: usize,
-) -> Result<JoinLeftData> {
+) -> Result<Vec<Arc<JoinLeftData>>> {
     let schema = left.schema();
 
     let (left_input, left_input_partition) = if let Some(partition) = partition {
@@ -839,45 +855,89 @@ async fn collect_left_input(
     // This operation performs 2 steps at once:
     // 1. creates a [JoinHashMap] of all batches from the stream
     // 2. stores the batches in a vector.
-    let initial = (Vec::new(), 0, metrics, reservation);
+    let partitioned_batches: [Vec<RecordBatch>; PARTITION_NUM] = Default::default();
+    let initial = (partitioned_batches, 0, metrics, reservation);
     let (batches, num_rows, metrics, mut reservation) = stream
-        .try_fold(initial, |mut acc, batch| async {
-            let batch_size = batch.get_array_memory_size();
-            // Reserve memory for incoming batch
-            acc.3.try_grow(batch_size)?;
-            // Update metrics
-            acc.2.build_mem_used.add(batch_size);
-            acc.2.build_input_batches.add(1);
-            acc.2.build_input_rows.add(batch.num_rows());
-            // Update rowcount
-            acc.1 += batch.num_rows();
-            // Push batch to output
-            acc.0.push(batch);
-            Ok(acc)
+        .try_fold(initial, |mut acc, batch| {
+            let on_left = on_left.clone();
+            let random_state = random_state.clone();
+            async move {
+                let batch_size = batch.get_array_memory_size();
+                // Reserve memory for incoming batch
+                acc.3.try_grow(batch_size)?;
+                // Update metrics
+                acc.2.build_mem_used.add(batch_size);
+                acc.2.build_input_batches.add(1);
+                acc.2.build_input_rows.add(batch.num_rows());
+                // Update rowcount
+                acc.1 += batch.num_rows();
+
+                let mut hashes_buffer = Vec::<u64>::with_capacity(batch.num_rows());
+                let keys_values = on_left
+                    .clone()
+                    .iter()
+                    .map(|c| c.evaluate(&batch)?.into_array(batch.num_rows()))
+                    .collect::<Result<Vec<_>>>()?;
+
+                // calculate the hash values
+                hashes_buffer.resize(batch.num_rows(), 0);
+                let hash_values =
+                    create_hashes(&keys_values, &random_state, &mut hashes_buffer)?;
+                let mut column_indexes = HashMap::with_capacity(PARTITION_NUM);
+                for (i, key) in hash_values.iter().enumerate() {
+                    column_indexes
+                        .entry(key % PARTITION_NUM as u64)
+                        .or_insert(UInt64BufferBuilder::new(0))
+                        .append(i as u64);
+                }
+                for i in 0..PARTITION_NUM {
+                    let mut columns = Vec::with_capacity(batch.num_columns());
+                    let indexes: UInt64Array = PrimitiveArray::new(
+                        column_indexes.entry(i as u64).or_default().finish().into(),
+                        None,
+                    );
+                    let rb = if indexes.is_empty() {
+                        RecordBatch::new_empty(batch.schema())
+                    } else {
+                        for col in batch.columns() {
+                            let scatter_col = take(col, &indexes, None)?;
+                            columns.push(scatter_col);
+                        }
+                        RecordBatch::try_new(batch.schema(), columns)?
+                    };
+                    acc.0[i].push(rb);
+                }
+
+                // Push batch to output
+                // acc.0.push(batch);
+                Ok(acc)
+            }
         })
         .await?;
 
-    // Estimation of memory size, required for hashtable, prior to allocation.
-    // Final result can be verified using `RawTable.allocation_info()`
-    let fixed_size = std::mem::size_of::<JoinHashMap>();
-    let estimated_hashtable_size =
-        estimate_memory_size::<(u64, u64)>(num_rows, fixed_size)?;
+    let mut ret = Vec::with_capacity(PARTITION_NUM);
 
-    reservation.try_grow(estimated_hashtable_size)?;
-    metrics.build_mem_used.add(estimated_hashtable_size);
+    for i in 0..PARTITION_NUM {
+        // Estimation of memory size, required for hashtable, prior to allocation.
+        // Final result can be verified using `RawTable.allocation_info()`
+        let batches_iter = batches[i].iter().rev();
+        let single_batch = concat_batches(&schema, batches_iter)?;
+        let part_num_rows = single_batch.num_rows();
+        let fixed_size = std::mem::size_of::<JoinHashMap>();
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u64, u64)>(part_num_rows, fixed_size)?;
 
-    let mut hashmap = JoinHashMap::with_capacity(num_rows);
-    let mut hashes_buffer = Vec::new();
-    let mut offset = 0;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
 
-    // Updating hashmap starting from the last batch
-    let batches_iter = batches.iter().rev();
-    for batch in batches_iter.clone() {
-        hashes_buffer.clear();
-        hashes_buffer.resize(batch.num_rows(), 0);
+        let mut hashmap = JoinHashMap::with_capacity(part_num_rows);
+        let mut hashes_buffer = vec![0; part_num_rows];
+        let mut offset = 0;
+
+        // Updating hashmap starting from the last batch
         update_hash(
             &on_left,
-            batch,
+            &single_batch,
             &mut hashmap,
             offset,
             &random_state,
@@ -885,33 +945,31 @@ async fn collect_left_input(
             0,
             true,
         )?;
-        offset += batch.num_rows();
+        // Merge all batches into a single batch, so we can directly index into the arrays
+
+        // Reserve additional memory for visited indices bitmap and create shared builder
+        let visited_indices_bitmap = if with_visited_indices_bitmap {
+            let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
+            reservation.try_grow(bitmap_size)?;
+            metrics.build_mem_used.add(bitmap_size);
+
+            let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
+            bitmap_buffer.append_n(part_num_rows, false);
+            bitmap_buffer
+        } else {
+            BooleanBufferBuilder::new(0)
+        };
+
+        let data = JoinLeftData::new(
+            hashmap,
+            single_batch,
+            Mutex::new(visited_indices_bitmap),
+            AtomicUsize::new(probe_threads_count),
+            // reservation.clone(),
+        );
+        ret.push(Arc::new(data));
     }
-    // Merge all batches into a single batch, so we can directly index into the arrays
-    let single_batch = concat_batches(&schema, batches_iter)?;
-
-    // Reserve additional memory for visited indices bitmap and create shared builder
-    let visited_indices_bitmap = if with_visited_indices_bitmap {
-        let bitmap_size = bit_util::ceil(single_batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size)?;
-        metrics.build_mem_used.add(bitmap_size);
-
-        let mut bitmap_buffer = BooleanBufferBuilder::new(single_batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
-    } else {
-        BooleanBufferBuilder::new(0)
-    };
-
-    let data = JoinLeftData::new(
-        hashmap,
-        single_batch,
-        Mutex::new(visited_indices_bitmap),
-        AtomicUsize::new(probe_threads_count),
-        reservation,
-    );
-
-    Ok(data)
+    Ok(ret)
 }
 
 /// Updates `hash_map` with new entries from `batch` evaluated against the expressions `on`
@@ -972,13 +1030,13 @@ enum BuildSide {
 /// Container for BuildSide::Initial related data
 struct BuildSideInitialState {
     /// Future for building hash table from build-side input
-    left_fut: OnceFut<JoinLeftData>,
+    left_fut: OnceFut<Vec<Arc<JoinLeftData>>>,
 }
 
 /// Container for BuildSide::Ready related data
 struct BuildSideReadyState {
     /// Collected build-side data
-    left_data: Arc<JoinLeftData>,
+    left_data: Arc<Vec<Arc<JoinLeftData>>>,
 }
 
 impl BuildSide {
@@ -1105,6 +1163,10 @@ struct HashJoinStream {
     batch_size: usize,
     /// Scratch space for computing hashes
     hashes_buffer: Vec<u64>,
+    right_senders: Vec<Arc<mpsc::SyncSender<ProcessProbeBatchState>>>,
+    result_rx: mpsc::Receiver<RecordBatch>,
+    result_tx: mpsc::SyncSender<RecordBatch>,
+    result_count: AtomicU64,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -1301,15 +1363,146 @@ impl HashJoinStream {
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         let build_timer = self.join_metrics.build_time.timer();
         // build hash table from left (build) side, if not yet done
-        let left_data = ready!(self
+        let left_data_batches = ready!(self
             .build_side
             .try_as_initial_mut()?
             .left_fut
             .get_shared(cx))?;
         build_timer.done();
 
+        let (result_tx, result_rx) = mpsc::sync_channel(PARTITION_NUM);
+        self.result_rx = result_rx;
+        self.result_tx = result_tx.clone();
+        let mut right_senders = Vec::with_capacity(PARTITION_NUM);
+        let null_equals_null = self.null_equals_null;
+        let on_right = self.on_right.clone();
+        let on_left = self.on_left.clone();
+        let batch_size = self.batch_size;
+        let schema = self.schema.clone();
+        let join_type = self.join_type;
+        let column_indices = self.column_indices.clone();
+        let filter = self.filter.clone();
+
+        for i in 0..PARTITION_NUM {
+            let batches = left_data_batches.clone();
+            let left_data = batches.get(i).unwrap().clone();
+            let (tx, mut rx) = mpsc::sync_channel::<ProcessProbeBatchState>(2);
+            let on_left = on_left.clone();
+            let on_right = on_right.clone();
+            let null_equals_null = null_equals_null;
+            let column_indices = column_indices.clone();
+            let schema = schema.clone();
+            let random_state = self.random_state.clone();
+            let filter = filter.clone();
+            right_senders.push(Arc::new(tx.clone()));
+            let result_sender = result_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let hash_map = left_data.hash_map();
+                let batch = left_data.batch();
+                while let Ok(state) = rx.recv() {
+                    let mut hashes_buffer = vec![0; state.batch.num_rows()];
+                    let right_keys_values = on_right.iter().
+                        map(|c| c.evaluate(&state.batch)?.into_array(state.batch.num_rows()))
+                        .collect::<Result<Vec<_>>>()?;
+                    create_hashes(&right_keys_values, &random_state, &mut hashes_buffer)?;
+                    // get the matched by join keys indices
+                    let (left_indices, right_indices, next_offset) = lookup_join_hashmap(
+                        hash_map,
+                        batch,
+                        &state.batch,
+                        &on_left,
+                        &on_right,
+                        null_equals_null,
+                        &hashes_buffer,
+                        batch_size,
+                        state.offset,
+                    )?;
+
+                    // apply join filter if exists
+                    let (left_indices, right_indices) = if let Some(filter) = &filter
+                    {
+                        apply_join_filter_to_indices(
+                            batch,
+                            &state.batch,
+                            left_indices,
+                            right_indices,
+                            filter,
+                            JoinSide::Left,
+                        )?
+                    } else {
+                        (left_indices, right_indices)
+                    };
+
+                    // mark joined left-side indices as visited, if required by join type
+                    if need_produce_result_in_final(join_type) {
+                        let mut bitmap = left_data.visited_indices_bitmap().lock();
+                        left_indices.iter().flatten().for_each(|x| {
+                            bitmap.set_bit(x as usize, true);
+                        });
+                    }
+
+                    // The goals of index alignment for different join types are:
+                    //
+                    // 1) Right & FullJoin -- to append all missing probe-side indices between
+                    //    previous (excluding) and current joined indices.
+                    // 2) SemiJoin -- deduplicate probe indices in range between previous
+                    //    (excluding) and current joined indices.
+                    // 3) AntiJoin -- return only missing indices in range between
+                    //    previous and current joined indices.
+                    //    Inclusion/exclusion of the indices themselves don't matter
+                    //
+                    // As a summary -- alignment range can be produced based only on
+                    // joined (matched with filters applied) probe side indices, excluding starting one
+                    // (left from previous iteration).
+
+                    // if any rows have been joined -- get last joined probe-side (right) row
+                    // it's important that index counts as "joined" after hash collisions checks
+                    // and join filters applied.
+                    let last_joined_right_idx = match right_indices.len() {
+                        0 => None,
+                        n => Some(right_indices.value(n - 1) as usize),
+                    };
+
+                    // Calculate range and perform alignment.
+                    // In case probe batch has been processed -- align all remaining rows.
+                    let index_alignment_range_start =
+                        state.joined_probe_idx.map_or(0, |v| v + 1);
+                    let index_alignment_range_end = if next_offset.is_none() {
+                        state.batch.num_rows()
+                    } else {
+                        last_joined_right_idx.map_or(0, |v| v + 1)
+                    };
+
+                    let (left_indices, right_indices) = adjust_indices_by_join_type(
+                        left_indices,
+                        right_indices,
+                        index_alignment_range_start..index_alignment_range_end,
+                        join_type,
+                    );
+
+                    let result = build_batch_from_indices(
+                        &schema,
+                        batch,
+                        &state.batch,
+                        &left_indices,
+                        &right_indices,
+                        &column_indices,
+                        JoinSide::Left,
+                    )?;
+                    let num = result.num_rows();
+                    // self.join_metrics.output_batches.add(1);
+                    // self.join_metrics.output_rows.add(result.num_rows());
+                    result_sender.send(result).
+                        expect("failed to send join result to channel");
+
+                }
+                Ok::<(), DataFusionError>(())
+            });
+        }
+        self.right_senders = right_senders;
+
         self.state = HashJoinStreamState::FetchProbeBatch;
-        self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
+        self.build_side = BuildSide::Ready(BuildSideReadyState { left_data: left_data_batches });
 
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
@@ -1336,14 +1529,53 @@ impl HashJoinStream {
 
                 self.hashes_buffer.clear();
                 self.hashes_buffer.resize(batch.num_rows(), 0);
-                create_hashes(&keys_values, &self.random_state, &mut self.hashes_buffer)?;
+                let hash_values = create_hashes(
+                    &keys_values,
+                    &self.random_state,
+                    &mut self.hashes_buffer,
+                )?;
+
+                let mut column_indexes = HashMap::with_capacity(PARTITION_NUM);
+                for (i, key) in hash_values.iter().enumerate() {
+                    column_indexes
+                        .entry(key % PARTITION_NUM as u64)
+                        .or_insert(UInt64BufferBuilder::new(0))
+                        .append(i as u64);
+                }
+                for i in 0..PARTITION_NUM {
+                    let mut columns = Vec::with_capacity(batch.num_columns());
+                    let indexes: UInt64Array = PrimitiveArray::new(
+                        column_indexes.entry(i as u64).or_default().finish().into(),
+                        None,
+                    );
+                    let rb = if indexes.is_empty() {
+                        RecordBatch::new_empty(batch.schema())
+                    } else {
+                        for col in batch.columns() {
+                            let scatter_col = take(col, &indexes, None)?;
+                            columns.push(scatter_col);
+                        }
+                        RecordBatch::try_new(batch.schema(), columns)?
+                    };
+
+                    if rb.num_rows() > 0 {
+                        self.right_senders.get(i).unwrap()
+                            .send(ProcessProbeBatchState {
+                                batch: rb,
+                                offset: (0, None),
+                                joined_probe_idx: None,
+                            }).expect("failed to send right probe data");
+                        self.result_count.fetch_add(1, Ordering::Acquire);
+                    }
+                }
 
                 self.join_metrics.input_batches.add(1);
                 self.join_metrics.input_rows.add(batch.num_rows());
 
                 self.state =
                     HashJoinStreamState::ProcessProbeBatch(ProcessProbeBatchState {
-                        batch,
+                        // batch,
+                        batch: RecordBatch::new_empty(self.schema.clone()),
                         offset: (0, None),
                         joined_probe_idx: None,
                     });
@@ -1360,109 +1592,42 @@ impl HashJoinStream {
     fn process_probe_batch(
         &mut self,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        let state = self.state.try_as_process_probe_batch_mut()?;
-        let build_side = self.build_side.try_as_ready_mut()?;
+        // let state = self.state.try_as_process_probe_batch_mut()?;
+        // let build_side = self.build_side.try_as_ready_mut()?;
 
-        let timer = self.join_metrics.join_time.timer();
 
-        // get the matched by join keys indices
-        let (left_indices, right_indices, next_offset) = lookup_join_hashmap(
-            build_side.left_data.hash_map(),
-            build_side.left_data.batch(),
-            &state.batch,
-            &self.on_left,
-            &self.on_right,
-            self.null_equals_null,
-            &self.hashes_buffer,
-            self.batch_size,
-            state.offset,
-        )?;
-
-        // apply join filter if exists
-        let (left_indices, right_indices) = if let Some(filter) = &self.filter {
-            apply_join_filter_to_indices(
-                build_side.left_data.batch(),
-                &state.batch,
-                left_indices,
-                right_indices,
-                filter,
-                JoinSide::Left,
-            )?
-        } else {
-            (left_indices, right_indices)
-        };
-
-        // mark joined left-side indices as visited, if required by join type
-        if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
-            left_indices.iter().flatten().for_each(|x| {
-                bitmap.set_bit(x as usize, true);
-            });
+        let rb = self.result_rx.recv().expect("failed to receive right probe batch");
+        if self.result_count.fetch_sub(1, Ordering::Acquire) == 1 {
+            self.state = HashJoinStreamState::FetchProbeBatch;
         }
 
-        // The goals of index alignment for different join types are:
+        // let mut batches = Vec::with_capacity(PARTITION_NUM);
+        // while self.result_count.load(Ordering::Relaxed) != 0 {
+        //     let rb = self.result_rx.recv().expect("failed to receive right probe batch");
+        //     self.result_count.fetch_sub(1, Ordering::Acquire);
+        //     if rb.num_rows() > 0 {
+        //         batches.push(rb);
+        //     }
+        // }
+        // let rb = concat_batches(&self.schema(), &batches)?;
+        // self.state = HashJoinStreamState::FetchProbeBatch;
+
+        // let rb = futures::executor::block_on(self.result_rx.recv()).expect("failed to receive right probe batch");
+        // let rb = self
+        //     .result_rx
+        //     .blocking_recv()
+        //     .expect("failed to receive right probe batch");
+        // if next_offset.is_none() {
+        //     self.state = HashJoinStreamState::FetchProbeBatch;
+        // } else {
+        //     state.advance(
+        //         next_offset
+        //             .ok_or_else(|| internal_datafusion_err!("unexpected None offset"))?,
+        //         last_joined_right_idx,
+        //     )
+        // };
         //
-        // 1) Right & FullJoin -- to append all missing probe-side indices between
-        //    previous (excluding) and current joined indices.
-        // 2) SemiJoin -- deduplicate probe indices in range between previous
-        //    (excluding) and current joined indices.
-        // 3) AntiJoin -- return only missing indices in range between
-        //    previous and current joined indices.
-        //    Inclusion/exclusion of the indices themselves don't matter
-        //
-        // As a summary -- alignment range can be produced based only on
-        // joined (matched with filters applied) probe side indices, excluding starting one
-        // (left from previous iteration).
-
-        // if any rows have been joined -- get last joined probe-side (right) row
-        // it's important that index counts as "joined" after hash collisions checks
-        // and join filters applied.
-        let last_joined_right_idx = match right_indices.len() {
-            0 => None,
-            n => Some(right_indices.value(n - 1) as usize),
-        };
-
-        // Calculate range and perform alignment.
-        // In case probe batch has been processed -- align all remaining rows.
-        let index_alignment_range_start = state.joined_probe_idx.map_or(0, |v| v + 1);
-        let index_alignment_range_end = if next_offset.is_none() {
-            state.batch.num_rows()
-        } else {
-            last_joined_right_idx.map_or(0, |v| v + 1)
-        };
-
-        let (left_indices, right_indices) = adjust_indices_by_join_type(
-            left_indices,
-            right_indices,
-            index_alignment_range_start..index_alignment_range_end,
-            self.join_type,
-        );
-
-        let result = build_batch_from_indices(
-            &self.schema,
-            build_side.left_data.batch(),
-            &state.batch,
-            &left_indices,
-            &right_indices,
-            &self.column_indices,
-            JoinSide::Left,
-        )?;
-
-        self.join_metrics.output_batches.add(1);
-        self.join_metrics.output_rows.add(result.num_rows());
-        timer.done();
-
-        if next_offset.is_none() {
-            self.state = HashJoinStreamState::FetchProbeBatch;
-        } else {
-            state.advance(
-                next_offset
-                    .ok_or_else(|| internal_datafusion_err!("unexpected None offset"))?,
-                last_joined_right_idx,
-            )
-        };
-
-        Ok(StatefulStreamResult::Ready(Some(result)))
+        Ok(StatefulStreamResult::Ready(Some(rb)))
     }
 
     /// Processes unmatched build-side rows for certain join types and produces output batch
@@ -1477,42 +1642,47 @@ impl HashJoinStream {
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
-
         let build_side = self.build_side.try_as_ready()?;
-        if !build_side.left_data.report_probe_completed() {
-            self.state = HashJoinStreamState::Completed;
-            return Ok(StatefulStreamResult::Continue);
+
+        let mut batches = Vec::new();
+        for left_data in build_side.left_data.iter() {
+            // if !left_data.report_probe_completed() {
+            //     self.state = HashJoinStreamState::Completed;
+            //     return Ok(StatefulStreamResult::Continue);
+            // }
+
+            // use the global left bitmap to produce the left indices and right indices
+            let (left_side, right_side) = get_final_indices_from_shared_bitmap(
+                left_data.visited_indices_bitmap(),
+                self.join_type,
+            );
+            let empty_right_batch = RecordBatch::new_empty(self.right.schema());
+            // use the left and right indices to produce the batch result
+            let result = build_batch_from_indices(
+                &self.schema,
+                left_data.batch(),
+                &empty_right_batch,
+                &left_side,
+                &right_side,
+                &self.column_indices,
+                JoinSide::Left,
+            );
+            if let Ok(batch) = result {
+                self.join_metrics.input_batches.add(1);
+                self.join_metrics.input_rows.add(batch.num_rows());
+
+                self.join_metrics.output_batches.add(1);
+                self.join_metrics.output_rows.add(batch.num_rows());
+
+                batches.push(batch);
+            }
         }
 
-        // use the global left bitmap to produce the left indices and right indices
-        let (left_side, right_side) = get_final_indices_from_shared_bitmap(
-            build_side.left_data.visited_indices_bitmap(),
-            self.join_type,
-        );
-        let empty_right_batch = RecordBatch::new_empty(self.right.schema());
-        // use the left and right indices to produce the batch result
-        let result = build_batch_from_indices(
-            &self.schema,
-            build_side.left_data.batch(),
-            &empty_right_batch,
-            &left_side,
-            &right_side,
-            &self.column_indices,
-            JoinSide::Left,
-        );
-
-        if let Ok(ref batch) = result {
-            self.join_metrics.input_batches.add(1);
-            self.join_metrics.input_rows.add(batch.num_rows());
-
-            self.join_metrics.output_batches.add(1);
-            self.join_metrics.output_rows.add(batch.num_rows());
-        }
         timer.done();
 
         self.state = HashJoinStreamState::Completed;
-
-        Ok(StatefulStreamResult::Ready(Some(result?)))
+        let batch = concat_batches(&self.schema, &batches)?;
+        Ok(StatefulStreamResult::Ready(Some(batch)))
     }
 }
 
@@ -1529,12 +1699,12 @@ impl Stream for HashJoinStream {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::{
         common, expressions::Column, memory::MemoryExec, repartition::RepartitionExec,
         test::build_table_i32, test::exec::MockExec,
     };
+    use std::default::Default;
 
     use arrow::array::{Date32Array, Int32Array, UInt32Builder, UInt64Builder};
     use arrow::datatypes::{DataType, Field};
